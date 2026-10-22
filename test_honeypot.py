@@ -362,5 +362,136 @@ class TestHoneypotComponents(unittest.TestCase):
         self.assertFalse(os.path.exists("C:\\var\\www\\test_isolation.txt"))
 
 
+    def test_epsv_response(self):
+        from honeypot.adaptive import decide_response
+        ctx = {"authenticated": True, "pasv_str": "229 Entering Extended Passive Mode (|||50003|)."}
+
+        plan = decide_response("test-epsv-session", "EPSV", {"command": "EPSV", "raw_args": ""}, context=ctx)
+        self.assertEqual(plan.response_status, 229)
+        self.assertEqual(plan.response_type, "extended_passive_mode")
+        self.assertIn("Extended Passive Mode", plan.response_text)
+
+        plan_noauth = decide_response("test-epsv-noauth", "EPSV", {"command": "EPSV"}, context={"authenticated": False})
+        self.assertEqual(plan_noauth.response_status, 530)
+
+    def test_feat_advertises_new_capabilities(self):
+        from honeypot.adaptive import decide_response
+        plan = decide_response("test-feat-session", "FEAT", {"command": "FEAT"})
+        self.assertEqual(plan.response_status, 211)
+        for feature in ["EPSV", "MDTM", "TVFS", "PASV", "UTF8", "SIZE"]:
+            self.assertIn(feature, plan.response_text)
+
+    def test_auth_pbsz_prot_rejected_as_not_implemented(self):
+        from honeypot.adaptive import decide_response
+        for cmd in ["AUTH TLS", "PBSZ 0", "PROT P"]:
+            parts = cmd.split(" ", 1)
+            plan = decide_response("test-tls-session", cmd, {"command": parts[0], "raw_args": parts[1] if len(parts) > 1 else ""})
+            self.assertEqual(plan.response_status, 502, f"{cmd} should return 502 Not Implemented")
+            self.assertEqual(plan.response_type, "tls_not_supported")
+
+    def test_opts_utf8(self):
+        from honeypot.adaptive import decide_response
+        session_id = "test-opts-session"
+
+        plan_ok = decide_response(session_id, "OPTS UTF8 ON", {"command": "OPTS", "raw_args": "UTF8 ON"})
+        self.assertEqual(plan_ok.response_status, 200)
+
+        plan_bad = decide_response(session_id, "OPTS FOO BAR", {"command": "OPTS", "raw_args": "FOO BAR"})
+        self.assertEqual(plan_bad.response_status, 501)
+
+    def test_mdtm_file_time(self):
+        from honeypot.adaptive import decide_response
+        session_id = "test-mdtm-session"
+        ctx = {"authenticated": True, "vfs": self.vfs}
+
+        plan_ok = decide_response(session_id, "MDTM /var/www/config.php", {"command": "MDTM", "path": "/var/www/config.php"}, context=ctx)
+        self.assertEqual(plan_ok.response_status, 213)
+        parts = plan_ok.response_text.split()
+        self.assertEqual(parts[0], "213")
+        self.assertTrue(parts[1].isdigit())
+        self.assertEqual(len(parts[1]), 14)
+
+        plan_missing = decide_response(session_id, "MDTM /no/such/file", {"command": "MDTM", "path": "/no/such/file"}, context=ctx)
+        self.assertEqual(plan_missing.response_status, 550)
+
+        plan_noauth = decide_response("test-mdtm-noauth", "MDTM /var/www/config.php", {"command": "MDTM", "path": "/var/www/config.php"}, context={"authenticated": False, "vfs": self.vfs})
+        self.assertEqual(plan_noauth.response_status, 530)
+
+    def test_rnfr_rnto_rename_flow(self):
+        from honeypot.adaptive import decide_response
+        session_id = "test-rename-session"
+        ctx = {"authenticated": True, "vfs": self.vfs}
+
+        plan_bad_seq = decide_response(session_id, "RNTO /home/admin/x.txt", {"command": "RNTO", "path": "/home/admin/x.txt"}, context=ctx)
+        self.assertEqual(plan_bad_seq.response_status, 503)
+
+        plan_rnfr_missing = decide_response(session_id, "RNFR /no/such/file", {"command": "RNFR", "path": "/no/such/file"}, context=ctx)
+        self.assertEqual(plan_rnfr_missing.response_status, 550)
+
+        plan_rnfr = decide_response(session_id, "RNFR /home/admin/readme.txt", {"command": "RNFR", "path": "/home/admin/readme.txt"}, context=ctx)
+        self.assertEqual(plan_rnfr.response_status, 350)
+
+        plan_rnto = decide_response(session_id, "RNTO /home/admin/renamed.txt", {"command": "RNTO", "path": "/home/admin/renamed.txt"}, context=ctx)
+        self.assertEqual(plan_rnto.response_status, 250)
+
+        self.assertIsNone(self.vfs.get_file_content("/home/admin/readme.txt"))
+        self.assertIsNotNone(self.vfs.get_file_content("/home/admin/renamed.txt"))
+
+        plan_rnto_again = decide_response(session_id, "RNTO /home/admin/again.txt", {"command": "RNTO", "path": "/home/admin/again.txt"}, context=ctx)
+        self.assertEqual(plan_rnto_again.response_status, 503)
+
+    def test_appe_returns_file_append_plan(self):
+        from honeypot.adaptive import decide_response
+        session_id = "test-appe-session"
+        ctx = {"authenticated": True, "vfs": self.vfs}
+
+        plan = decide_response(session_id, "APPE /var/log/syslog", {"command": "APPE", "path": "/var/log/syslog"}, context=ctx)
+        self.assertEqual(plan.response_status, 150)
+        self.assertEqual(plan.response_type, "file_append")
+
+        plan_noauth = decide_response("test-appe-noauth", "APPE /var/log/syslog", {"command": "APPE", "path": "/var/log/syslog"}, context={"authenticated": False, "vfs": self.vfs})
+        self.assertEqual(plan_noauth.response_status, 530)
+
+    def test_abor_always_succeeds(self):
+        from honeypot.adaptive import decide_response
+        plan = decide_response("test-abor-session", "ABOR", {"command": "ABOR"}, context={"authenticated": False})
+        self.assertEqual(plan.response_status, 226)
+        self.assertEqual(plan.response_type, "abort_transfer")
+
+    def test_stat_help_mode_stru_site_responses(self):
+        from honeypot.adaptive import decide_response
+        session_id = "test-misc-session"
+        ctx = {"authenticated": True}
+
+        plan_stat = decide_response(session_id, "STAT", {"command": "STAT", "raw_args": ""}, context=ctx)
+        self.assertEqual(plan_stat.response_status, 211)
+        self.assertIn("FTP server status", plan_stat.response_text)
+
+        plan_help = decide_response(session_id, "HELP", {"command": "HELP"}, context=ctx)
+        self.assertEqual(plan_help.response_status, 214)
+        self.assertIn("RNFR", plan_help.response_text)
+
+        plan_mode_ok = decide_response(session_id, "MODE S", {"command": "MODE", "raw_args": "S"}, context=ctx)
+        self.assertEqual(plan_mode_ok.response_status, 200)
+        plan_mode_bad = decide_response(session_id, "MODE Z", {"command": "MODE", "raw_args": "Z"}, context=ctx)
+        self.assertEqual(plan_mode_bad.response_status, 504)
+
+        plan_stru_ok = decide_response(session_id, "STRU F", {"command": "STRU", "raw_args": "F"}, context=ctx)
+        self.assertEqual(plan_stru_ok.response_status, 200)
+        plan_stru_bad = decide_response(session_id, "STRU R", {"command": "STRU", "raw_args": "R"}, context=ctx)
+        self.assertEqual(plan_stru_bad.response_status, 504)
+
+        plan_site_chmod = decide_response(session_id, "SITE CHMOD 755 file.txt", {"command": "SITE", "raw_args": "CHMOD 755 file.txt"}, context=ctx)
+        self.assertEqual(plan_site_chmod.response_status, 200)
+        plan_site_unknown = decide_response(session_id, "SITE FOO", {"command": "SITE", "raw_args": "FOO"}, context=ctx)
+        self.assertEqual(plan_site_unknown.response_status, 502)
+
+    def test_unknown_command_fallback_still_works(self):
+        from honeypot.adaptive import decide_response
+        plan = decide_response("test-unknown-session", "FOOBAR", {"command": "FOOBAR"}, context={"authenticated": True})
+        self.assertEqual(plan.response_status, 500)
+        self.assertEqual(plan.response_type, "unknown_command")
+
+
 if __name__ == "__main__":
     unittest.main()

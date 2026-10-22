@@ -93,17 +93,46 @@ class AdaptiveDeceptionEngine:
             logger.info(f"[Adaptive Engine] Tarpitting session {session_id[:8]} for {result['delay_seconds']}s")
 
         elif action == "DYNAMIC_INJECTION":
-            # Dynamically inject fake database backup if attacker is probing config.php
-            if command == "RETR" and "config.php" in (args or "").lower():
-                injected_path = "/var/www/database_backup.sql"
-                backup_sql_content = (
-                    "-- AegisFTP Dynamic Deception Trap Dump\n"
-                    "CREATE TABLE admin_credentials (id INT, email VARCHAR(100), pass_hash VARCHAR(255));\n"
-                    "INSERT INTO admin_credentials VALUES (1, 'sysadmin@internal-corp.local', '$2y$10$e8N3v...fakehash');\n"
-                )
-                vfs_instance.add_file(injected_path, backup_sql_content.encode('utf-8'), owner="www-data")
-                result["injected_file"] = injected_path
-                logger.info(f"[Adaptive Engine] Injected honeypot asset {injected_path} into VFS for session {session_id[:8]}")
+            # Dynamically inject a believable honeypot asset based on which
+            # sensitive file the attacker is probing (covers every keyword
+            # that can trigger SENSITIVE_FILE_PROBING, not just config.php).
+            args_lower = (args or "").lower()
+            injection_map = [
+                ("config.php", "/var/www/database_backup.sql",
+                 "-- AegisFTP Dynamic Deception Trap Dump\n"
+                 "CREATE TABLE admin_credentials (id INT, email VARCHAR(100), pass_hash VARCHAR(255));\n"
+                 "INSERT INTO admin_credentials VALUES (1, 'sysadmin@internal-corp.local', '$2y$10$e8N3v...fakehash');\n",
+                 "www-data"),
+                ("passwd", "/etc/passwd.bak",
+                 "root:x:0:0:root:/root:/bin/bash\n"
+                 "backup-admin:x:1500:1500:Backup Service Account:/home/backup-admin:/bin/bash\n"
+                 "svc-deploy:x:1501:1501:Deploy Automation:/home/svc-deploy:/bin/bash\n",
+                 "root"),
+                ("shadow", "/root/.ssh/id_rsa.bak",
+                 "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+                 "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABlwAAAAdzc2gtcn\n"
+                 "NhAAAAAwEAAQAAAYEA0fakehoneypottrapkeycontentdonotusethisanywhererea\n"
+                 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n"
+                 "-----END OPENSSH PRIVATE KEY-----\n",
+                 "root"),
+                ("backup", "/home/admin/db_credentials.txt",
+                 "# Production DB Credentials - DO NOT COMMIT\n"
+                 "DB_HOST=10.0.4.12\n"
+                 "DB_USER=dbadmin\n"
+                 "DB_PASS=Tr4pp3d-Cr3dent1al-2026!\n",
+                 "admin"),
+            ]
+
+            if command == "RETR":
+                for keyword, injected_path, content, owner in injection_map:
+                    if keyword in args_lower:
+                        vfs_instance.add_file(injected_path, content.encode('utf-8'), owner=owner)
+                        result["injected_file"] = injected_path
+                        logger.info(
+                            f"[Adaptive Engine] Injected honeypot asset {injected_path} into VFS "
+                            f"for session {session_id[:8]} (probe keyword: {keyword})"
+                        )
+                        break
 
         elif action == "FAKE_PERM_ERROR":
             if command in ["RETR", "CWD", "DELE"] and any(s in (args or "").lower() for s in ["shadow", "backup", "root"]):
@@ -228,7 +257,18 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
         return ResponsePlan("215 UNIX Type: L8", 215, "system_info", delay_seconds=delay_seconds)
 
     elif cmd == "FEAT":
-        feat_str = "211-Features:\r\n PASV\r\n UTF8\r\n REST STREAM\r\n SIZE\r\n MLSD\r\n211 End"
+        feat_str = (
+            "211-Features:\r\n"
+            " EPSV\r\n"
+            " PASV\r\n"
+            " UTF8\r\n"
+            " REST STREAM\r\n"
+            " SIZE\r\n"
+            " MDTM\r\n"
+            " MLSD\r\n"
+            " TVFS\r\n"
+            "211 End"
+        )
         return ResponsePlan(feat_str, 211, "features_list", delay_seconds=delay_seconds)
 
     elif cmd in ["PWD", "XPWD"]:
@@ -401,6 +441,143 @@ def decide_response(session_id: str, action: str, parameters: dict, context: dic
 
     elif cmd == "NOOP":
         return ResponsePlan("200 OK.", 200, "noop_response", delay_seconds=delay_seconds)
+
+    elif cmd in ["EPSV", "EPSV4"]:
+        if not sess.get("authenticated", False):
+            return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
+        epsv_str = sess.get("pasv_str", "229 Entering Extended Passive Mode.")
+        return ResponsePlan(epsv_str, 229, "extended_passive_mode", delay_seconds=delay_seconds)
+
+    elif cmd in ["AUTH", "PBSZ", "PROT"]:
+        # This honeypot mimics a ProFTPD build without mod_tls, so a real
+        # server would reject these with "not implemented" rather than
+        # a generic "unknown command" (which is a honeypot tell on its own).
+        return ResponsePlan(f"502 {cmd} command not implemented.", 502, "tls_not_supported", delay_seconds=delay_seconds)
+
+    elif cmd == "OPTS":
+        opts_val = raw_args.strip().upper()
+        if opts_val in ["UTF8 ON", "UTF8"]:
+            return ResponsePlan("200 UTF8 set to on.", 200, "opts_response", delay_seconds=delay_seconds)
+        return ResponsePlan("501 Option not understood.", 501, "opts_error", delay_seconds=delay_seconds)
+
+    elif cmd == "MDTM":
+        if not sess.get("authenticated", False):
+            return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
+        cwd = sess.get("cwd", "/var/www")
+        target = parameters.get("path") or raw_args.strip()
+        if not target:
+            return ResponsePlan("501 Syntax error, filename required.", 501, "syntax_error", delay_seconds=delay_seconds)
+        if vfs_instance:
+            target_path = vfs_instance.normalize_path(cwd, target)
+            node = vfs_instance.get_node(target_path)
+            if node and not node.is_dir:
+                mtime_str = time.strftime("%Y%m%d%H%M%S", time.gmtime(node.mtime))
+                return ResponsePlan(f"213 {mtime_str}", 213, "file_mtime", delay_seconds=delay_seconds)
+        return ResponsePlan("550 File not found.", 550, "file_error", delay_seconds=delay_seconds)
+
+    elif cmd == "RNFR":
+        if not sess.get("authenticated", False):
+            return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
+        cwd = sess.get("cwd", "/var/www")
+        target = parameters.get("path") or raw_args.strip()
+        if not target:
+            return ResponsePlan("501 Syntax error, filename required.", 501, "syntax_error", delay_seconds=delay_seconds)
+        if vfs_instance:
+            target_path = vfs_instance.normalize_path(cwd, target)
+            node = vfs_instance.get_node(target_path)
+            if node:
+                sess["rnfr_path"] = target_path
+                return ResponsePlan("350 File exists, ready for destination name.", 350, "rename_from", delay_seconds=delay_seconds)
+        return ResponsePlan("550 File or directory not found.", 550, "file_error", delay_seconds=delay_seconds)
+
+    elif cmd == "RNTO":
+        if not sess.get("authenticated", False):
+            return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
+        rnfr_path = sess.pop("rnfr_path", None)
+        if not rnfr_path:
+            return ResponsePlan("503 Bad sequence of commands (RNFR required first).", 503, "bad_sequence", delay_seconds=delay_seconds)
+        cwd = sess.get("cwd", "/var/www")
+        target = parameters.get("path") or raw_args.strip()
+        if not target:
+            return ResponsePlan("501 Syntax error, filename required.", 501, "syntax_error", delay_seconds=delay_seconds)
+        if vfs_instance:
+            dest_path = vfs_instance.normalize_path(cwd, target)
+            src_node = vfs_instance.get_node(rnfr_path)
+            if src_node and not src_node.is_dir:
+                dest_existing = vfs_instance.get_node(dest_path)
+                if dest_existing and dest_existing.is_dir:
+                    return ResponsePlan("553 Target is a directory.", 553, "file_error", delay_seconds=delay_seconds)
+                vfs_instance.add_file(dest_path, src_node.content, owner=src_node.owner, group=src_node.group)
+                vfs_instance.remove_file(rnfr_path)
+                return ResponsePlan("250 Rename successful.", 250, "rename_success", delay_seconds=delay_seconds)
+        return ResponsePlan("550 Rename failed.", 550, "file_error", delay_seconds=delay_seconds)
+
+    elif cmd == "APPE":
+        if not sess.get("authenticated", False):
+            return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
+        filename = parameters.get("path") or raw_args.strip()
+        if not filename:
+            return ResponsePlan("501 Syntax error, filename required.", 501, "syntax_error", delay_seconds=delay_seconds)
+        cwd = sess.get("cwd", "/var/www")
+        if vfs_instance:
+            target_path = vfs_instance.normalize_path(cwd, filename)
+            target_node = vfs_instance.get_node(target_path)
+            if target_node and target_node.is_dir:
+                return ResponsePlan("553 Target is a directory.", 553, "file_error", delay_seconds=delay_seconds)
+        return ResponsePlan("150 Ok to send data.", 150, "file_append", delay_seconds=delay_seconds)
+
+    elif cmd == "ABOR":
+        return ResponsePlan("226 ABOR command successful.", 226, "abort_transfer", delay_seconds=delay_seconds)
+
+    elif cmd == "STAT":
+        target = parameters.get("path") or raw_args.strip()
+        if target:
+            if not sess.get("authenticated", False):
+                return ResponsePlan("530 Please login with USER and PASS.", 530, "auth_required", delay_seconds=delay_seconds)
+            return ResponsePlan(
+                f"213-Status of {target}:\r\n Not available in this mode.\r\n213 End of status.",
+                213, "status_response", delay_seconds=delay_seconds
+            )
+        login_line = ("     Logged in as " + (sess.get("authenticated_user") or "anonymous")) if sess.get("authenticated", False) else "     Not logged in"
+        status_text = (
+            "211-FTP server status:\r\n"
+            f"     Connected to {sess.get('client_ip', 'unknown')}\r\n"
+            f"{login_line}\r\n"
+            "     TYPE: Binary\r\n"
+            "211 End of status."
+        )
+        return ResponsePlan(status_text, 211, "status_response", delay_seconds=delay_seconds)
+
+    elif cmd == "HELP":
+        help_text = (
+            "214-The following commands are recognized:\r\n"
+            " USER PASS SYST FEAT PWD  CWD  CDUP TYPE PASV EPSV PORT\r\n"
+            " LIST NLST RETR STOR APPE DELE MKD  RMD  SIZE MDTM RNFR\r\n"
+            " RNTO ABOR STAT HELP NOOP MODE STRU SITE QUIT\r\n"
+            "214 Help OK."
+        )
+        return ResponsePlan(help_text, 214, "help_response", delay_seconds=delay_seconds)
+
+    elif cmd == "MODE":
+        mode_val = raw_args.strip().upper()
+        if mode_val == "S":
+            return ResponsePlan("200 Mode set to S.", 200, "mode_response", delay_seconds=delay_seconds)
+        return ResponsePlan("504 Command not implemented for that parameter.", 504, "error_response", delay_seconds=delay_seconds)
+
+    elif cmd == "STRU":
+        stru_val = raw_args.strip().upper()
+        if stru_val == "F":
+            return ResponsePlan("200 Structure set to F.", 200, "stru_response", delay_seconds=delay_seconds)
+        return ResponsePlan("504 Command not implemented for that parameter.", 504, "error_response", delay_seconds=delay_seconds)
+
+    elif cmd == "SITE":
+        site_args = raw_args.strip()
+        site_cmd = site_args.split(" ", 1)[0].upper() if site_args else ""
+        if site_cmd == "CHMOD":
+            return ResponsePlan("200 SITE CHMOD command successful.", 200, "site_chmod", delay_seconds=delay_seconds)
+        elif site_cmd == "HELP":
+            return ResponsePlan("214 SITE CHMOD", 214, "site_help", delay_seconds=delay_seconds)
+        return ResponsePlan(f"502 SITE command '{site_cmd}' not implemented.", 502, "site_unimplemented", delay_seconds=delay_seconds)
 
     elif cmd == "QUIT":
         _adapter_sessions.pop(session_id, None)
